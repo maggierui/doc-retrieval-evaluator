@@ -1,28 +1,39 @@
 import os
 import json
+import logging
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
-from azure.identity import DefaultAzureCredential
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
+from azure.search.documents.models import VectorizedQuery, QueryType
 from azure.ai.evaluation import RetrievalEvaluator
+from openai import AzureOpenAI
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # Configuration
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX")
 AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 
+# Setup Logging
+logging.basicConfig(level=logging.WARNING)
+
 def get_search_client():
     # Treat placeholder or empty string as None
     key = AZURE_SEARCH_KEY
-    if key and "<your-key>" in key:
-        key = None
+    if key and ("<your-key>" in key or "#" in key):
+         # Try to clean it if it has comments
+         if "#" in key:
+             key = key.split("#")[0].strip()
+         if "<your-key>" in key:
+             key = None
 
     if key:
         credential = AzureKeyCredential(key)
@@ -35,37 +46,56 @@ def get_search_client():
         credential=credential
     )
 
+def get_openai_client():
+    # Force Token Auth since Key Auth is disabled on the resource
+    token_provider = get_bearer_token_provider(
+        DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+    )
+    return AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        azure_ad_token_provider=token_provider,
+        api_version="2024-02-15-preview"
+    )
+
+def generate_embedding(client, text, model_name):
+    # Ensure deployment name matches what is deployed in your Azure OpenAI service
+    return client.embeddings.create(input=[text], model=model_name).data[0].embedding
+
 def main():
     # 1. Initialize Clients
     search_client = get_search_client()
+    openai_client = get_openai_client()
     
     # Model config for the Judge (Azure OpenAI)
     model_config = {
         "azure_endpoint": AZURE_OPENAI_ENDPOINT,
         "azure_deployment": AZURE_OPENAI_DEPLOYMENT,
-        "api_key": AZURE_OPENAI_API_KEY,
-        "api_version": "2024-02-15-preview" # Update as needed
+        "api_key": AZURE_OPENAI_API_KEY, # Evaluator might check this
+        "api_version": "2024-02-15-preview" 
     }
     
     # Initialize the RetrievalEvaluator
-    # We force DefaultAzureCredential because Key-based auth is disabled on the Azure OpenAI resource.
     credential = DefaultAzureCredential()
     
-    # Remove api_key from model_config to ensure the SDK uses the TokenCredential
+    # Force remove api_key so SDK uses the TokenCredential
     if "api_key" in model_config:
         del model_config["api_key"]
 
-    evaluator = RetrievalEvaluator(model_config=model_config, credential=credential)
+    try:
+        evaluator = RetrievalEvaluator(model_config=model_config, credential=credential)
+    except Exception as e:
+        print(f"Warning: Failed to initialize RetrievalEvaluator: {e}")
+        evaluator = None
 
     # 2. Define Test Queries
-    # You can load this from a file or add more here.
     test_queries = [
         "What are the benefits of SharePoint?",
         "How do I create a communication site?",
-        # Add your specific domain queries here
+        "How to publish to internet sites?" 
     ]
 
-    print(f"Starting evaluation of {len(test_queries)} queries...")
+    print(f"Starting evaluation of {len(test_queries)} queries... (Saving full context)")
+    print(f"Using Embedding Model: {AZURE_OPENAI_EMBEDDING_DEPLOYMENT} (Assumed match for index dimension 3072)")
     print("-" * 50)
 
     results = []
@@ -74,80 +104,88 @@ def main():
         print(f"Processing Query: {query}")
         
         # 3. Retrieve Documents
-        # We retrieve top 3 documents to simulate the RAG context window
         try:
-            search_results = search_client.search(search_text=query, top=3)
+            # Generate Embedding
+            try:
+                embedding = generate_embedding(openai_client, query, AZURE_OPENAI_EMBEDDING_DEPLOYMENT)
+                vector_query = VectorizedQuery(vector=embedding, k_nearest_neighbors=50, fields="text_vector")
+            except Exception as e:
+                print(f"  Error generating embedding: {e}")
+                print(f"  Ensure deployment '{AZURE_OPENAI_EMBEDDING_DEPLOYMENT}' exists.")
+                continue
+
+            # Hybrid Search + Semantic Reranking
+            search_results = search_client.search(
+                search_text=query,
+                vector_queries=[vector_query],
+                top=3, # RAG context window
+                query_type=QueryType.SEMANTIC,
+                semantic_configuration_name="semantic-docs"
+            )
             
-            # Combine retrieved chunks into a single context string
-            # Note: We assume the index has a 'content' field. Adjust if your field is named differently (e.g., 'text', 'chunk').
+            # Combine retrieved chunks
             retrieved_docs = []
+            formatted_docs = []
             retrieved_chunks_info = []
 
-            for doc in search_results:
-                # Fallback to getting all values if 'content' key specific doesn't exist used for demo
-                content = doc.get('content') or doc.get('text') or doc.get('chunk') or str(doc)
+            for i, doc in enumerate(search_results, 1):
+                content = doc.get('chunk') or doc.get('content') or str(doc)
+                title = doc.get('title') or "Unknown Source"
+                
+                # Raw content for evaluator
                 retrieved_docs.append(content)
+                
+                # Formatted content for debugging/JSON
+                formatted_docs.append(f"--- [Chunk {i} | Source: {title}] ---\n{content}")
 
-                # Capture metadata for debugging
                 chunk_meta = {
                     "search_score": doc.get("@search.score"),
+                    "reranker_score": doc.get("@search.reranker_score"),
                     "id": doc.get("id") or doc.get("chunk_id"),
-                    "filepath": doc.get("filepath") or doc.get("filename") or doc.get("metadata_storage_name"),
-                    "url": doc.get("url"),
                     "title": doc.get("title")
                 }
-                # Clean up None values
                 chunk_meta = {k: v for k, v in chunk_meta.items() if v is not None}
                 retrieved_chunks_info.append(chunk_meta)
             
+            # Context used for LLM evaluation (clean)
             retrieved_context = "\n\n".join(retrieved_docs)
             
-            # Aggressive sanitization to prevent Prompty/Markdown image loading issues
-            retrieved_context = retrieved_context.replace("cs-1.png", "cs-1_png_placeholder")
+            # Context saved to file for user inspection (detailed)
+            debug_context = "\n\n".join(formatted_docs)
+            
+            # Sanitization of evaluation context
+            retrieved_context = retrieved_context.replace("cs-1.png", "cs-1_placeholder")
             retrieved_context = retrieved_context.replace(".png", "_png")
             retrieved_context = retrieved_context.replace(".jpg", "_jpg")
-            # Break Markdown image syntax just in case
-            retrieved_context = retrieved_context.replace("![", "[")
+            retrieved_context = retrieved_context.replace("![", "[") # Break image syntax
             
             if not retrieved_context.strip():
                 print("  Warning: No documents found.")
                 continue
 
-            print(f"  > Retrieved {len(retrieved_docs)} docs. Context length: {len(retrieved_context)} chars.")
-            
-            # Debug: Check for image paths in context
-            if "cs-1.png" in retrieved_context:
-                print("  > WARNING: Found 'cs-1.png' in retrieved context!")
-            
-            # 4. Evaluate using LLM Judge
-            # Usage: Try passing query and context directly for single-turn evaluation
-            try:
-                # Direct call for query + context
-                eval_result = evaluator(query=query, context=retrieved_context)
-            except Exception as e:
-                print(f"  > Direct call failed ({e}). Trying conversation format...")
-                conversation_input = {
-                    "messages": [{"role": "user", "content": query}],
-                    "context": retrieved_context
-                }
-                eval_result = evaluator(conversation=conversation_input)
-            
-            # Debug: Print the full result to understand why score isn't appearing
-            # print(f"DEBUG: eval_result = {eval_result}")
+            print(f"  > Retrieved {len(retrieved_docs)} docs.")
+            for info in retrieved_chunks_info:
+                 print(f"    - [{info.get('reranker_score', 0.0):.2f}] {info.get('title')}")
 
-            # Extract score
-            # Note: The key might be 'gpt_retrieval' or 'retrieval' depending on SDK version.
-            score = eval_result.get('retrieval') or eval_result.get('gpt_retrieval')
-
-            if score is None:
-                print(f"  > Warning: Score is None. Raw result: {eval_result}")
-            else:
-                print(f"  > Score: {score}")
+            # 4. Evaluate
+            score = None
+            reason = None
+            if evaluator:
+                try:
+                    eval_result = evaluator(query=query, context=retrieved_context)
+                    score = eval_result.get('retrieval') or eval_result.get('gpt_retrieval')
+                    reason = eval_result.get('retrieval_reason') or eval_result.get('gpt_retrieval_reason')
+                    print(f"  > Score: {score}")
+                    print(f"  > Reason: {reason}")
+                except Exception as e:
+                    print(f"  Evaluation failed: {e}")
 
             results.append({
                 "query": query,
                 "score": score,
+                "reason": reason,
                 "retrieved_context_preview": retrieved_context[:200] + "...",
+                "full_retrieved_context": debug_context,
                 "retrieved_chunks": retrieved_chunks_info
             })
 
@@ -157,13 +195,14 @@ def main():
     # 5. Summary
     print("-" * 50)
     if results:
-        avg_score = sum(r['score'] for r in results if r['score'] is not None) / len(results)
-        print(f"Average Retrieval Score: {avg_score:.2f} / 5.0")
+        valid_scores = [r['score'] for r in results if r['score'] is not None]
+        if valid_scores:
+            avg_score = sum(valid_scores) / len(valid_scores)
+            print(f"Average Retrieval Score: {avg_score:.2f} / 5.0")
         
-        # Save detailed results
-        with open("evaluation_results.json", "w") as f:
+        with open("evaluation_results_formatted.json", "w") as f:
             json.dump(results, f, indent=2)
-        print("Detailed results saved to evaluation_results.json")
+        print("Detailed results saved to evaluation_results_formatted.json")
     else:
         print("No results to summarize.")
 
