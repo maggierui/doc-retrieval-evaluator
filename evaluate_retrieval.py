@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import argparse
+import csv
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -61,7 +63,64 @@ def generate_embedding(client, text, model_name):
     # Ensure deployment name matches what is deployed in your Azure OpenAI service
     return client.embeddings.create(input=[text], model=model_name).data[0].embedding
 
+def load_test_queries(file_path):
+    """Loads queries from a CSV or TXT file."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Input file not found: {file_path}")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    queries = []
+
+    # Attempt to read with different encodings
+    encodings_to_try = ['utf-8', 'utf-8-sig', 'cp1252', 'latin-1']
+    
+    content = None
+    used_encoding = None
+
+    # Read file content first
+    for enc in encodings_to_try:
+        try:
+            with open(file_path, 'r', encoding=enc) as f:
+                content = f.read()
+            used_encoding = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    
+    if content is None:
+        raise ValueError(f"Could not read file {file_path} with supported encodings ({encodings_to_try}).")
+    
+    # Process content based on extension
+    if ext == '.csv':
+        from io import StringIO
+        f = StringIO(content)
+        reader = csv.reader(f)
+        # Try to infer if there is a header. If the first row's first cell is "query" or "question", skip it.
+        # Simplified: Just read the first column of every row.
+        first_row = True
+        for row in reader:
+            if not row: continue
+            val = row[0].strip()
+            if first_row:
+                if val.lower() in ['query', 'question', 'text']:
+                    first_row = False
+                    continue
+                first_row = False
+            if val:
+                queries.append(val)
+    elif ext == '.txt':
+        queries = [line.strip() for line in content.splitlines() if line.strip()]
+    else:
+        raise ValueError("Unsupported file format. Please use .csv or .txt")
+    
+    print(f"Successfully loaded file using encoding: {used_encoding}")
+    return queries
+
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate RAG Retrieval using Azure AI Search and Azure OpenAI.")
+    parser.add_argument("--input", type=str, help="Path to a CSV or TXT file containing test queries.")
+    args = parser.parse_args()
+
     # 1. Initialize Clients
     search_client = get_search_client()
     openai_client = get_openai_client()
@@ -88,11 +147,19 @@ def main():
         evaluator = None
 
     # 2. Define Test Queries
-    test_queries = [
-        "What are the benefits of SharePoint?",
-        "How do I create a communication site?",
-        "How to publish to internet sites?" 
-    ]
+    if args.input:
+        try:
+            test_queries = load_test_queries(args.input)
+            print(f"Loaded {len(test_queries)} queries from {args.input}")
+        except Exception as e:
+            print(f"Error loading queries: {e}")
+            return
+    else:
+        test_queries = [
+            "What are the benefits of SharePoint?",
+            "How do I create a communication site?",
+            "How to publish to internet sites?" 
+        ]
 
     print(f"Starting evaluation of {len(test_queries)} queries... (Saving full context)")
     print(f"Using Embedding Model: {AZURE_OPENAI_EMBEDDING_DEPLOYMENT} (Assumed match for index dimension 3072)")
@@ -203,6 +270,28 @@ def main():
         with open("evaluation_results_formatted.json", "w") as f:
             json.dump(results, f, indent=2)
         print("Detailed results saved to evaluation_results_formatted.json")
+
+        # Save as CSV
+        csv_file = "evaluation_results.csv"
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Define headers
+            headers = ["query", "score", "reason", "retrieved_context_preview", "full_retrieved_context", "retrieved_chunks"]
+            writer.writerow(headers)
+
+            for result in results:
+                # Convert complex objects to JSON strings for CSV compatibility
+                chunks_json = json.dumps(result.get("retrieved_chunks", []), ensure_ascii=False)
+                
+                writer.writerow([
+                    result.get("query"),
+                    result.get("score"),
+                    result.get("reason"),
+                    result.get("retrieved_context_preview"),
+                    result.get("full_retrieved_context"),
+                    chunks_json
+                ])
+        print(f"Detailed results saved to {csv_file}")
     else:
         print("No results to summarize.")
 
