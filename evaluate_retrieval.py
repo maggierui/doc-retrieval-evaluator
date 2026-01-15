@@ -118,7 +118,7 @@ def main():
             search_results = search_client.search(
                 search_text=query,
                 vector_queries=[vector_query],
-                top=3, # RAG context window
+                top=5, # RAG context window
                 query_type=QueryType.SEMANTIC,
                 semantic_configuration_name="semantic-docs"
             )
